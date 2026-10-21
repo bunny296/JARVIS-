@@ -443,7 +443,9 @@ jobs:
           import android.view.Gravity
           import android.widget.Button
           import android.widget.EditText
-          import android.widget.LinearLayo
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
           class MainActivity : Activity() {
 
               private lateinit var status: TextView
@@ -639,5 +641,3 @@ jobs:
         with:
           name: jarvis-apk
           path: jarvis-app/app/build/outputs/apk/debug/app-debug.apk
-          
-          
