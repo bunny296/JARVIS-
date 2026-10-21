@@ -160,21 +160,30 @@ jobs:
 
               // ---------- mode switching ----------
 
+              // Stop the reader thread BEFORE releasing the microphone, otherwise the app crashes
+              private fun releaseService() {
+                  try { speechService?.stop() } catch (e: Exception) { }
+                  try { speechService?.shutdown() } catch (e: Exception) { }
+                  speechService = null
+              }
+
               private fun startWakeListening() {
-                  speechService?.shutdown()
+                  mode = Mode.SWITCHING
+                  releaseService()
                   wakeRec?.reset()
                   speechService = SpeechService(wakeRec, 16000.0f).also { it.startListening(this) }
-                  mode = Mode.WAKE
+                  // Posted so any late callbacks from the old listener are ignored first
+                  main.post { mode = Mode.WAKE }
                   update("Listening for \"Jarvis\"")
               }
 
               private fun startCommandListening() {
                   mode = Mode.SWITCHING
-                  speechService?.shutdown()
+                  releaseService()
                   commandRec?.reset()
                   // Stop automatically after 8 seconds if nothing is said
                   speechService = SpeechService(commandRec, 16000.0f).also { it.startListening(this, 8000) }
-                  mode = Mode.COMMAND
+                  main.post { mode = Mode.COMMAND }
                   update("Listening for your command...")
               }
 
@@ -270,7 +279,8 @@ jobs:
               }
 
               override fun onDestroy() {
-                  speechService?.shutdown()
+                  mode = Mode.SWITCHING
+                  releaseService()
                   wakeRec?.close()
                   commandRec?.close()
                   model?.close()
@@ -400,6 +410,11 @@ jobs:
           mv vosk-model-small-en-us-0.15 app/src/main/assets/model-en-us
           rm model.zip
 
+      - name: Install fixed signing key (so updates install over old versions)
+        run: |
+          mkdir -p ~/.android
+          echo "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" | base64 -d > ~/.android/debug.keystore
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
@@ -412,4 +427,6 @@ jobs:
         with:
           name: jarvis-apk
           path: jarvis-app/app/build/outputs/apk/debug/app-debug.apk
+          
+
           
