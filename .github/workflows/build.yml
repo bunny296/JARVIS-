@@ -296,10 +296,21 @@ jobs:
                   }.start()
               }
 
+              // Uses the voice and pitch chosen in the app (re-read before every reply)
+              private fun applyVoice() {
+                  val p = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+                  val name = p.getString("voice_name", null)
+                  if (name != null) {
+                      tts?.voices?.firstOrNull { it.name == name }?.let { tts?.voice = it }
+                  }
+                  tts?.setPitch(p.getFloat("pitch", 1.0f))
+              }
+
               private fun reply(text: String) {
                   val clean = text.replace("*", "").replace("#", "").replace("`", "").trim()
                   showAlert("Jarvis: ${clean.take(200)}")
                   if (ttsReady) {
+                      applyVoice()
                       tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "jarvis_reply")
                       // Safety net in case speech never reports completion
                       main.postDelayed({ resumeWake() }, 45000)
@@ -417,6 +428,7 @@ jobs:
           import android.content.pm.PackageManager
           import android.os.Build
           import android.os.Bundle
+          import android.speech.tts.TextToSpeech
           import android.text.InputType
           import android.view.Gravity
           import android.widget.Button
@@ -431,8 +443,42 @@ jobs:
 
               private fun prefs() = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
 
+              private var previewTts: TextToSpeech? = null
+              private var previewReady = false
+
+              // English voices installed on this phone, in a stable order
+              private fun englishVoices() =
+                  (previewTts?.voices ?: emptySet())
+                      .filter { it.locale.language == "en" }
+                      .sortedBy { it.name }
+
+              private fun speakSample() {
+                  val voices = englishVoices()
+                  if (!previewReady || voices.isEmpty()) {
+                      status.text = "No voices found yet. Try again in a moment."
+                      return
+                  }
+                  val next = (prefs().getInt("voice_index", -1) + 1) % voices.size
+                  val v = voices[next]
+                  prefs().edit().putInt("voice_index", next).putString("voice_name", v.name).apply()
+                  previewTts?.voice = v
+                  previewTts?.setPitch(prefs().getFloat("pitch", 1.0f))
+                  status.text = "Voice ${next + 1} of ${voices.size}\n(${v.name})"
+                  previewTts?.speak(
+                      "Hello, I am Jarvis. This is voice ${next + 1}.",
+                      TextToSpeech.QUEUE_FLUSH, null, "preview"
+                  )
+              }
+
+              override fun onDestroy() {
+                  previewTts?.shutdown()
+                  super.onDestroy()
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+
+                  previewTts = TextToSpeech(this) { s -> previewReady = (s == TextToSpeech.SUCCESS) }
 
                   val layout = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -473,11 +519,27 @@ jobs:
                           status.text = "Jarvis is off"
                       }
                   }
+                  val voiceBtn = Button(this).apply {
+                      text = "Change voice"
+                      setOnClickListener { speakSample() }
+                  }
+                  val pitchBtn = Button(this).apply {
+                      fun label() = if (prefs().getFloat("pitch", 1.0f) < 1.0f) "Deeper pitch: ON" else "Deeper pitch: OFF"
+                      text = label()
+                      setOnClickListener {
+                          val deeper = prefs().getFloat("pitch", 1.0f) < 1.0f
+                          prefs().edit().putFloat("pitch", if (deeper) 1.0f else 0.8f).apply()
+                          text = label()
+                          speakSample()
+                      }
+                  }
                   layout.addView(status)
                   layout.addView(keyBox)
                   layout.addView(save)
                   layout.addView(start)
                   layout.addView(stop)
+                  layout.addView(voiceBtn)
+                  layout.addView(pitchBtn)
                   setContentView(layout)
               }
 
