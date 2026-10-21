@@ -1,0 +1,357 @@
+name: Build Jarvis APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Generate the Jarvis project
+        run: |
+          mkdir -p "$(dirname jarvis-app/app/build.gradle.kts)"
+          cat > jarvis-app/app/build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.jarvis"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.jarvis"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              // Keep model files uncompressed so they copy out of assets quickly
+              androidResources {
+                  noCompress += listOf("mdl", "fst", "conf", "int", "txt", "mat", "stats", "dubm", "ie", "json")
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("net.java.dev.jna:jna:5.13.0@aar")
+              implementation("com.alphacephei:vosk-android:0.3.47@aar")
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname jarvis-app/app/src/main/AndroidManifest.xml)"
+          cat > jarvis-app/app/src/main/AndroidManifest.xml <<'JARVIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Jarvis"
+                  android:theme="@android:style/Theme.DeviceDefault">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".JarvisService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          JARVIS_EOF
+          mkdir -p "$(dirname jarvis-app/app/src/main/java/com/example/jarvis/JarvisService.kt)"
+          cat > jarvis-app/app/src/main/java/com/example/jarvis/JarvisService.kt <<'JARVIS_EOF'
+          package com.example.jarvis
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.os.IBinder
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import androidx.core.app.ServiceCompat
+          import org.json.JSONObject
+          import org.vosk.Model
+          import org.vosk.Recognizer
+          import org.vosk.android.RecognitionListener
+          import org.vosk.android.SpeechService
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class JarvisService : Service(), RecognitionListener {
+
+              private var model: Model? = null
+              private var speechService: SpeechService? = null
+              private var lastTrigger = 0L
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("jarvis_listen", "Jarvis listening", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  nm.createNotificationChannel(
+                      NotificationChannel("jarvis_alert", "Jarvis alerts", NotificationManager.IMPORTANCE_HIGH)
+                  )
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  ServiceCompat.startForeground(
+                      this, 1, listeningNotification("Loading speech model..."),
+                      ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  )
+                  if (speechService == null) {
+                      Thread {
+                          try {
+                              val modelDir = copyModelFromAssets()
+                              model = Model(modelDir.absolutePath)
+                              // Only listen for "jarvis"; everything else becomes [unk]
+                              val rec = Recognizer(model, 16000.0f, "[\"jarvis\", \"[unk]\"]")
+                              speechService = SpeechService(rec, 16000.0f)
+                              speechService?.startListening(this)
+                              update("Listening for \"Jarvis\"")
+                          } catch (e: Exception) {
+                              update("Error: ${e.message}")
+                          }
+                      }.start()
+                  }
+                  return START_STICKY
+              }
+
+              private fun copyModelFromAssets(): File {
+                  val target = File(filesDir, "model")
+                  if (File(target, "am/final.mdl").exists()) return target
+                  target.deleteRecursively()
+                  copyAssetDir("model-en-us", target)
+                  return target
+              }
+
+              private fun copyAssetDir(assetPath: String, dest: File) {
+                  val children = assets.list(assetPath) ?: emptyArray()
+                  if (children.isEmpty()) {
+                      dest.parentFile?.mkdirs()
+                      assets.open(assetPath).use { input ->
+                          FileOutputStream(dest).use { out -> input.copyTo(out) }
+                      }
+                  } else {
+                      dest.mkdirs()
+                      for (child in children) copyAssetDir("$assetPath/$child", File(dest, child))
+                  }
+              }
+
+              private fun listeningNotification(text: String): Notification =
+                  Notification.Builder(this, "jarvis_listen")
+                      .setContentTitle("Jarvis")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true)
+                      .build()
+
+              private fun update(text: String) {
+                  getSystemService(NotificationManager::class.java).notify(1, listeningNotification(text))
+              }
+
+              private fun heard(json: String, key: String) {
+                  val text = try { JSONObject(json).optString(key) } catch (e: Exception) { "" }
+                  if (!text.contains("jarvis")) return
+                  val now = System.currentTimeMillis()
+                  if (now - lastTrigger < 3000) return  // cooldown against repeat triggers
+                  lastTrigger = now
+                  onWakeWord()
+              }
+
+              private fun onWakeWord() {
+                  ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100).startTone(ToneGenerator.TONE_PROP_BEEP)
+                  val vib = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                  vib.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
+                  val n = Notification.Builder(this, "jarvis_alert")
+                      .setContentTitle("Jarvis")
+                      .setContentText("Yes? I heard you.")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setAutoCancel(true)
+                      .build()
+                  getSystemService(NotificationManager::class.java).notify(2, n)
+              }
+
+              // --- Vosk RecognitionListener ---
+              override fun onPartialResult(hypothesis: String?) { hypothesis?.let { heard(it, "partial") } }
+              override fun onResult(hypothesis: String?) { hypothesis?.let { heard(it, "text") } }
+              override fun onFinalResult(hypothesis: String?) { hypothesis?.let { heard(it, "text") } }
+              override fun onError(exception: Exception?) { update("Error: ${exception?.message}") }
+              override fun onTimeout() {}
+
+              override fun onDestroy() {
+                  speechService?.stop()
+                  speechService?.shutdown()
+                  model?.close()
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname jarvis-app/app/src/main/java/com/example/jarvis/MainActivity.kt)"
+          cat > jarvis-app/app/src/main/java/com/example/jarvis/MainActivity.kt <<'JARVIS_EOF'
+          package com.example.jarvis
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(48, 48, 48, 48)
+                  }
+                  status = TextView(this).apply {
+                      text = "Jarvis is off"
+                      textSize = 20f
+                      gravity = Gravity.CENTER
+                  }
+                  val start = Button(this).apply {
+                      text = "Start Jarvis"
+                      setOnClickListener { startJarvis() }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Stop Jarvis"
+                      setOnClickListener {
+                          stopService(Intent(this@MainActivity, JarvisService::class.java))
+                          status.text = "Jarvis is off"
+                      }
+                  }
+                  layout.addView(status)
+                  layout.addView(start)
+                  layout.addView(stop)
+                  setContentView(layout)
+              }
+
+              private fun startJarvis() {
+                  val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33) needed.add(Manifest.permission.POST_NOTIFICATIONS)
+                  val missing = needed.filter {
+                      checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+                  }
+                  if (missing.isNotEmpty()) {
+                      requestPermissions(missing.toTypedArray(), 1)
+                  } else {
+                      launchService()
+                  }
+              }
+
+              private fun launchService() {
+                  startForegroundService(Intent(this, JarvisService::class.java))
+                  status.text = "Jarvis is listening...\nSay \"Jarvis\""
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                      launchService()
+                  } else {
+                      status.text = "Microphone permission is required"
+                  }
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname jarvis-app/build.gradle.kts)"
+          cat > jarvis-app/build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname jarvis-app/gradle.properties)"
+          cat > jarvis-app/gradle.properties <<'JARVIS_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          JARVIS_EOF
+          mkdir -p "$(dirname jarvis-app/settings.gradle.kts)"
+          cat > jarvis-app/settings.gradle.kts <<'JARVIS_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Jarvis"
+          include(":app")
+          JARVIS_EOF
+
+      - name: Download offline speech model
+        run: |
+          cd jarvis-app
+          curl -L -o model.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          unzip -q model.zip
+          mkdir -p app/src/main/assets
+          mv vosk-model-small-en-us-0.15 app/src/main/assets/model-en-us
+          rm model.zip
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build APK
+        working-directory: jarvis-app
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-apk
+          path: jarvis-app/app/build/outputs/apk/debug/app-debug.apk
