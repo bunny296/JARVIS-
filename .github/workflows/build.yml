@@ -99,7 +99,9 @@ jobs:
           import android.content.pm.ServiceInfo
           import android.media.AudioManager
           import android.media.ToneGenerator
+          import android.os.Handler
           import android.os.IBinder
+          import android.os.Looper
           import android.os.VibrationEffect
           import android.os.Vibrator
           import androidx.core.app.ServiceCompat
@@ -113,8 +115,14 @@ jobs:
 
           class JarvisService : Service(), RecognitionListener {
 
+              private enum class Mode { WAKE, COMMAND, SWITCHING }
+
+              private val main = Handler(Looper.getMainLooper())
               private var model: Model? = null
+              private var wakeRec: Recognizer? = null      // only knows "jarvis"
+              private var commandRec: Recognizer? = null   // full vocabulary
               private var speechService: SpeechService? = null
+              private var mode = Mode.SWITCHING
               private var lastTrigger = 0L
 
               override fun onCreate() {
@@ -133,22 +141,111 @@ jobs:
                       this, 1, listeningNotification("Loading speech model..."),
                       ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                   )
-                  if (speechService == null) {
+                  if (model == null) {
                       Thread {
                           try {
                               val modelDir = copyModelFromAssets()
-                              model = Model(modelDir.absolutePath)
-                              // Only listen for "jarvis"; everything else becomes [unk]
-                              val rec = Recognizer(model, 16000.0f, "[\"jarvis\", \"[unk]\"]")
-                              speechService = SpeechService(rec, 16000.0f)
-                              speechService?.startListening(this)
-                              update("Listening for \"Jarvis\"")
+                              val m = Model(modelDir.absolutePath)
+                              model = m
+                              wakeRec = Recognizer(m, 16000.0f, "[\"jarvis\", \"[unk]\"]")
+                              commandRec = Recognizer(m, 16000.0f)
+                              main.post { startWakeListening() }
                           } catch (e: Exception) {
                               update("Error: ${e.message}")
                           }
                       }.start()
                   }
                   return START_STICKY
+              }
+
+              // ---------- mode switching ----------
+
+              private fun startWakeListening() {
+                  speechService?.shutdown()
+                  wakeRec?.reset()
+                  speechService = SpeechService(wakeRec, 16000.0f).also { it.startListening(this) }
+                  mode = Mode.WAKE
+                  update("Listening for \"Jarvis\"")
+              }
+
+              private fun startCommandListening() {
+                  mode = Mode.SWITCHING
+                  speechService?.shutdown()
+                  commandRec?.reset()
+                  // Stop automatically after 8 seconds if nothing is said
+                  speechService = SpeechService(commandRec, 16000.0f).also { it.startListening(this, 8000) }
+                  mode = Mode.COMMAND
+                  update("Listening for your command...")
+              }
+
+              private fun finishCommand(text: String) {
+                  if (mode != Mode.COMMAND) return
+                  mode = Mode.SWITCHING
+                  if (text.isNotBlank()) showAlert("You said: \"$text\"") else showAlert("I didn't catch that.")
+                  // Switch back after the current callback returns
+                  main.post { startWakeListening() }
+              }
+
+              // ---------- Vosk callbacks ----------
+
+              override fun onPartialResult(hypothesis: String?) {
+                  if (mode == Mode.WAKE && hypothesis != null && textOf(hypothesis, "partial").contains("jarvis")) {
+                      val now = System.currentTimeMillis()
+                      if (now - lastTrigger < 3000) return
+                      lastTrigger = now
+                      beepAndVibrate()
+                      main.post { startCommandListening() }
+                      mode = Mode.SWITCHING
+                  }
+              }
+
+              override fun onResult(hypothesis: String?) {
+                  if (mode == Mode.COMMAND && hypothesis != null) finishCommand(textOf(hypothesis, "text"))
+              }
+
+              override fun onFinalResult(hypothesis: String?) {
+                  if (mode == Mode.COMMAND && hypothesis != null) finishCommand(textOf(hypothesis, "text"))
+              }
+
+              override fun onTimeout() {
+                  if (mode == Mode.COMMAND) finishCommand("")
+              }
+
+              override fun onError(exception: Exception?) {
+                  update("Error: ${exception?.message}")
+              }
+
+              // ---------- helpers ----------
+
+              private fun textOf(json: String, key: String): String =
+                  try { JSONObject(json).optString(key) } catch (e: Exception) { "" }
+
+              private fun beepAndVibrate() {
+                  ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100).startTone(ToneGenerator.TONE_PROP_BEEP)
+                  val vib = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                  vib.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
+              }
+
+              private fun showAlert(text: String) {
+                  val n = Notification.Builder(this, "jarvis_alert")
+                      .setContentTitle("Jarvis")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setAutoCancel(true)
+                      .build()
+                  getSystemService(NotificationManager::class.java).notify(2, n)
+              }
+
+              private fun listeningNotification(text: String): Notification =
+                  Notification.Builder(this, "jarvis_listen")
+                      .setContentTitle("Jarvis")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true)
+                      .build()
+
+              private fun update(text: String) {
+                  getSystemService(NotificationManager::class.java).notify(1, listeningNotification(text))
               }
 
               private fun copyModelFromAssets(): File {
@@ -172,50 +269,10 @@ jobs:
                   }
               }
 
-              private fun listeningNotification(text: String): Notification =
-                  Notification.Builder(this, "jarvis_listen")
-                      .setContentTitle("Jarvis")
-                      .setContentText(text)
-                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                      .setOngoing(true)
-                      .build()
-
-              private fun update(text: String) {
-                  getSystemService(NotificationManager::class.java).notify(1, listeningNotification(text))
-              }
-
-              private fun heard(json: String, key: String) {
-                  val text = try { JSONObject(json).optString(key) } catch (e: Exception) { "" }
-                  if (!text.contains("jarvis")) return
-                  val now = System.currentTimeMillis()
-                  if (now - lastTrigger < 3000) return  // cooldown against repeat triggers
-                  lastTrigger = now
-                  onWakeWord()
-              }
-
-              private fun onWakeWord() {
-                  ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100).startTone(ToneGenerator.TONE_PROP_BEEP)
-                  val vib = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-                  vib.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
-                  val n = Notification.Builder(this, "jarvis_alert")
-                      .setContentTitle("Jarvis")
-                      .setContentText("Yes? I heard you.")
-                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                      .setAutoCancel(true)
-                      .build()
-                  getSystemService(NotificationManager::class.java).notify(2, n)
-              }
-
-              // --- Vosk RecognitionListener ---
-              override fun onPartialResult(hypothesis: String?) { hypothesis?.let { heard(it, "partial") } }
-              override fun onResult(hypothesis: String?) { hypothesis?.let { heard(it, "text") } }
-              override fun onFinalResult(hypothesis: String?) { hypothesis?.let { heard(it, "text") } }
-              override fun onError(exception: Exception?) { update("Error: ${exception?.message}") }
-              override fun onTimeout() {}
-
               override fun onDestroy() {
-                  speechService?.stop()
                   speechService?.shutdown()
+                  wakeRec?.close()
+                  commandRec?.close()
                   model?.close()
                   super.onDestroy()
               }
@@ -355,3 +412,4 @@ jobs:
         with:
           name: jarvis-apk
           path: jarvis-app/app/build/outputs/apk/debug/app-debug.apk
+          
