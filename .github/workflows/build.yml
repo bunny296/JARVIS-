@@ -59,11 +59,19 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+              <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
               <uses-permission android:name="android.permission.VIBRATE" />
+
+              <!-- Needed so the app can find the phone's text-to-speech engine -->
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
 
               <application
                   android:allowBackup="false"
@@ -72,7 +80,8 @@ jobs:
 
                   <activity
                       android:name=".MainActivity"
-                      android:exported="true">
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -104,7 +113,10 @@ jobs:
           import android.os.Looper
           import android.os.VibrationEffect
           import android.os.Vibrator
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
           import androidx.core.app.ServiceCompat
+          import org.json.JSONArray
           import org.json.JSONObject
           import org.vosk.Model
           import org.vosk.Recognizer
@@ -112,10 +124,22 @@ jobs:
           import org.vosk.android.SpeechService
           import java.io.File
           import java.io.FileOutputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.Locale
 
           class JarvisService : Service(), RecognitionListener {
 
-              private enum class Mode { WAKE, COMMAND, SWITCHING }
+              private enum class Mode { WAKE, COMMAND, SWITCHING, THINKING }
+
+              companion object {
+                  // If Google renames this model, change it here
+                  const val GEMINI_MODEL = "gemini-flash-latest"
+                  const val SYSTEM_PROMPT =
+                      "You are Jarvis, a helpful voice assistant on a phone. " +
+                      "Answer in one to three short sentences of plain spoken English. " +
+                      "No markdown, no lists, no emojis."
+              }
 
               private val main = Handler(Looper.getMainLooper())
               private var model: Model? = null
@@ -124,6 +148,9 @@ jobs:
               private var speechService: SpeechService? = null
               private var mode = Mode.SWITCHING
               private var lastTrigger = 0L
+
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
 
               override fun onCreate() {
                   super.onCreate()
@@ -134,6 +161,18 @@ jobs:
                   nm.createNotificationChannel(
                       NotificationChannel("jarvis_alert", "Jarvis alerts", NotificationManager.IMPORTANCE_HIGH)
                   )
+                  tts = TextToSpeech(this) { status ->
+                      if (status == TextToSpeech.SUCCESS) {
+                          tts?.language = Locale.US
+                          tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                              override fun onStart(utteranceId: String?) {}
+                              override fun onDone(utteranceId: String?) { main.post { resumeWake() } }
+                              @Deprecated("Deprecated in Java")
+                              override fun onError(utteranceId: String?) { main.post { resumeWake() } }
+                          })
+                          ttsReady = true
+                      }
+                  }
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -187,12 +226,86 @@ jobs:
                   update("Listening for your command...")
               }
 
+              private fun resumeWake() {
+                  if (mode == Mode.THINKING) startWakeListening()
+              }
+
               private fun finishCommand(text: String) {
                   if (mode != Mode.COMMAND) return
                   mode = Mode.SWITCHING
-                  if (text.isNotBlank()) showAlert("You said: \"$text\"") else showAlert("I didn't catch that.")
-                  // Switch back after the current callback returns
-                  main.post { startWakeListening() }
+                  if (text.isBlank()) {
+                      showAlert("I didn't catch that.")
+                      main.post { startWakeListening() }
+                      return
+                  }
+                  showAlert("You said: \"$text\"")
+                  main.post {
+                      releaseService()          // free the microphone while Jarvis thinks and talks
+                      mode = Mode.THINKING
+                      update("Thinking...")
+                      askGemini(text)
+                  }
+              }
+
+              // ---------- Gemini ----------
+
+              private fun askGemini(question: String) {
+                  val key = getSharedPreferences("jarvis", Context.MODE_PRIVATE).getString("api_key", "") ?: ""
+                  if (key.isBlank()) {
+                      reply("Please open the Jarvis app and save your Gemini API key.")
+                      return
+                  }
+                  Thread {
+                      var answer: String
+                      try {
+                          val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent")
+                          val conn = url.openConnection() as HttpURLConnection
+                          conn.requestMethod = "POST"
+                          conn.connectTimeout = 15000
+                          conn.readTimeout = 30000
+                          conn.doOutput = true
+                          conn.setRequestProperty("Content-Type", "application/json")
+                          conn.setRequestProperty("x-goog-api-key", key)
+
+                          val body = JSONObject()
+                              .put("system_instruction", JSONObject().put("parts",
+                                  JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT))))
+                              .put("contents", JSONArray().put(JSONObject().put("parts",
+                                  JSONArray().put(JSONObject().put("text", question)))))
+                              .put("generationConfig", JSONObject().put("maxOutputTokens", 800))
+                          conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+                          val code = conn.responseCode
+                          val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                          val raw = stream.bufferedReader().use { it.readText() }
+                          answer = if (code in 200..299) {
+                              JSONObject(raw).getJSONArray("candidates").getJSONObject(0)
+                                  .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                                  .getString("text")
+                          } else {
+                              val msg = try { JSONObject(raw).getJSONObject("error").getString("message") }
+                                        catch (e: Exception) { raw }
+                              showAlert("Gemini error $code: ${msg.take(150)}")
+                              "Sorry, I couldn't reach my brain. Error $code."
+                          }
+                      } catch (e: Exception) {
+                          showAlert("Network error: ${e.message}")
+                          answer = "Sorry, I couldn't connect. Check your internet."
+                      }
+                      main.post { reply(answer) }
+                  }.start()
+              }
+
+              private fun reply(text: String) {
+                  val clean = text.replace("*", "").replace("#", "").replace("`", "").trim()
+                  showAlert("Jarvis: ${clean.take(200)}")
+                  if (ttsReady) {
+                      tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "jarvis_reply")
+                      // Safety net in case speech never reports completion
+                      main.postDelayed({ resumeWake() }, 45000)
+                  } else {
+                      resumeWake()
+                  }
               }
 
               // ---------- Vosk callbacks ----------
@@ -239,6 +352,7 @@ jobs:
                   val n = Notification.Builder(this, "jarvis_alert")
                       .setContentTitle("Jarvis")
                       .setContentText(text)
+                      .setStyle(Notification.BigTextStyle().bigText(text))
                       .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                       .setAutoCancel(true)
                       .build()
@@ -281,6 +395,8 @@ jobs:
               override fun onDestroy() {
                   mode = Mode.SWITCHING
                   releaseService()
+                  tts?.stop()
+                  tts?.shutdown()
                   wakeRec?.close()
                   commandRec?.close()
                   model?.close()
@@ -296,18 +412,24 @@ jobs:
 
           import android.Manifest
           import android.app.Activity
+          import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.os.Build
           import android.os.Bundle
+          import android.text.InputType
           import android.view.Gravity
           import android.widget.Button
+          import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.TextView
 
           class MainActivity : Activity() {
 
               private lateinit var status: TextView
+              private lateinit var keyBox: EditText
+
+              private fun prefs() = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -318,9 +440,27 @@ jobs:
                       setPadding(48, 48, 48, 48)
                   }
                   status = TextView(this).apply {
-                      text = "Jarvis is off"
-                      textSize = 20f
+                      text = if (prefs().getString("api_key", "").isNullOrBlank())
+                          "Jarvis is off\nPaste your Gemini API key below"
+                      else "Jarvis is off\nAPI key saved"
+                      textSize = 18f
                       gravity = Gravity.CENTER
+                  }
+                  keyBox = EditText(this).apply {
+                      hint = "Gemini API key"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setSingleLine(true)
+                  }
+                  val save = Button(this).apply {
+                      text = "Save key"
+                      setOnClickListener {
+                          val k = keyBox.text.toString().trim()
+                          if (k.isNotEmpty()) {
+                              prefs().edit().putString("api_key", k).apply()
+                              keyBox.setText("")
+                              status.text = "API key saved"
+                          }
+                      }
                   }
                   val start = Button(this).apply {
                       text = "Start Jarvis"
@@ -334,6 +474,8 @@ jobs:
                       }
                   }
                   layout.addView(status)
+                  layout.addView(keyBox)
+                  layout.addView(save)
                   layout.addView(start)
                   layout.addView(stop)
                   setContentView(layout)
@@ -427,6 +569,4 @@ jobs:
         with:
           name: jarvis-apk
           path: jarvis-app/app/build/outputs/apk/debug/app-debug.apk
-          
-
           
